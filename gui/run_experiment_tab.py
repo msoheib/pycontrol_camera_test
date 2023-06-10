@@ -5,6 +5,12 @@ import importlib
 from datetime import datetime
 from collections import OrderedDict
 
+
+from importlib import import_module, reload
+#from config.gui_settings import update_interval
+#from config.paths import dirs
+
+
 from concurrent.futures import ThreadPoolExecutor
 from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
 from serial import SerialException
@@ -245,6 +251,53 @@ class Run_experiment_tab(QtWidgets.QWidget):
         self.setups_started  = 0
         self.setups_finished = 0
 
+        # Initialise API
+        self.initialise_API()
+        for i, board in enumerate(self.boards):
+            if self.APIs[i]: self.APIs[i].set_state_machine(board.sm_info)
+
+    def initialise_API(self):
+        # If task file specifies a user API attempt to initialise it.
+        self.APIs = [None] * len(self.boards)
+        for i, board in enumerate(self.boards):
+            print_to_log = self.subjectboxes[i].print_to_log
+            # Remove previous API from data consumers.
+            ### Currently commented out as API is initialised after Data_logger
+            # board.data_logger.data_consumers = [self.experiment_plot.
+                                                # subject_plots[i], 
+                                                # self.subjectboxes[i]]
+            if not 'api_class' in board.sm_info['variables']:
+                return  #  Setup does not use API.
+            API_name = eval(board.sm_info['variables']['api_class'])
+            # Try to import and instantiate the user API.
+            try:
+                user_module_name = 'api.user_classes.{}'.format(API_name)
+                user_module = import_module(user_module_name)
+                reload(user_module)
+            except ModuleNotFoundError:
+                print_to_log('\nCould not find user API module: {}'
+                                  .format(user_module_name))
+                return
+            if not hasattr(user_module, API_name):
+                print_to_log('\nCould not find user API class "{}" in {}'
+                    .format(API_name, user_module_name))
+                return
+            
+            try:
+                user_API_class = getattr(user_module, API_name)
+                # Individual API classes for single setups also have access to 
+                # information about the experiments and other setups
+                user_API_class.set_experiment_info(self.experiment, setup_idx=i)
+                user_API = user_API_class()
+                user_API.interface(board, print_to_log)
+                print_to_log('\nInitialised API: {}'.format(API_name))
+                self.APIs[i] = user_API
+                user_API.api_communication(self.APIs)
+                board.data_logger.data_consumers.append(user_API)
+            except Exception as e:
+                print_to_log('Unable to intialise API: {}\n\n'.format(API_name)
+                                  + 'Traceback: \n\n {}'.format(e))
+
     def startstopclose_all(self):
         '''Called when startstopclose_all_button is clicked.  Button is
         only active if all setups are in the same state.'''
@@ -275,6 +328,9 @@ class Run_experiment_tab(QtWidgets.QWidget):
         self.update_timer.stop()
         self.GUI_main.refresh_timer.start(self.GUI_main.refresh_interval)
         for board in self.boards:
+            # Stop running boards.
+            if board.framework_running:
+                if self.APIs[i]: self.APIs[i].run_stop()  # Do we need this?
             time.sleep(0.05)
             board.process_data()
         # Summary and persistent variables.
@@ -359,8 +415,9 @@ class Run_experiment_tab(QtWidgets.QWidget):
 
     def update(self):
         '''Called regularly while experiment is running'''
-        for subjectbox in self.subjectboxes:
+        for subjectbox, api in zip(self.subjectboxes, self.APIs):
             subjectbox.update()
+            if api: api.update()
         self.experiment_plot.update()
         if self.setups_finished == len(self.boards):
             self.stop_experiment()
